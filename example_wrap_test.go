@@ -13,7 +13,7 @@ import (
 type customError struct{ error }
 
 // GoString implements fmt.GoStringer for the %#v format directive.
-// It is employed here to ensure to ensure consistent example output.
+// It is employed here to ensure consistent example output.
 func (c *customError) GoString() string {
 	return "&" + fmt.Sprintf("%T{error:%#v}", c, c.error)[1:]
 }
