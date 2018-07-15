@@ -15,13 +15,68 @@ import (
 type ErrorBag struct {
 	errs    []error
 	wrapper ErrorWrapper
+	defers  []ErrorFunc
 }
 
-// Error implements error for the ErrorBag eb. If eb contains only 1 error, the
-// the results of its Error method are returned. If eb contains more then
-// 1 error, then a message is returned indicating how many errors it encounted;
-// the caller should use Errors or Visit to access the contained errors.
-// When eb contains no errors an empty string is returned.
+// ErrorFunc is a function that takes no arguments and returns an error.
+// It is one of the two valid types accepted by New's others parameter.
+type ErrorFunc = func() error
+
+// New returns an ErrorBag. If err is nil, nil is returned. If err is already
+// an ErrorBag, then it will be returned (as an ErrorBag). Otherwise, a new
+// (non-wrapping) ErrorBag will be created and returned.
+// If any values are passed as others, then each must either be an error
+// or an ErrorFunc -- otherwize, New will panic (so, don't do that). In the
+// former case, the error is added to the new ErrorBag while in the latter,
+// the ErrorFunc is executed and its result (if non-nil) will be added to the
+// returning ErrorBag.
+// Note that ErrorFuncs passed in others will not be executed if err is nil;
+// this makes them good targets for an io.Closer's Close method (which just
+// happens to be an ErrorFunc (imagine that?)).
+func New(err error, others ...interface{}) *ErrorBag {
+	if err == nil {
+		return nil
+	}
+
+	eb := AsErrorBag(err)
+
+	if eb == nil {
+		eb = new(ErrorBag)
+		eb.add(err)
+	}
+
+	eb.stash(others...)
+
+	return eb
+}
+
+func (eb *ErrorBag) stash(items ...interface{}) {
+	for _, i := range items {
+		if i == nil {
+			continue
+		}
+
+		switch v := i.(type) {
+		case error:
+			eb.add(v)
+
+		case ErrorFunc:
+			if v != nil {
+				eb.add(v())
+			}
+
+		default:
+			panic(fmt.Sprintf("type '%T' is neither error nor ErrorFunc", v))
+		}
+	}
+}
+
+// Error implements the error interface for the ErrorBag eb. If eb contains
+// only 1 error, the the results of that error's Error method are returned.
+// If eb contains more then 1 error, then a message is returned indicating
+// how many errors it encounted; the caller should use Errors or Visit to
+// access the contained errors.  When eb contains no errors an empty string
+// is returned.
 func (eb *ErrorBag) Error() string {
 	if l := len(eb.errs); l == 1 {
 		return eb.errs[0].Error()
@@ -46,10 +101,11 @@ func (eb *ErrorBag) Sorted() []error {
 // ErrorOrNil returns eb if it contains any errors whatsoever, otherwise it
 // returns nil.
 func (eb *ErrorBag) ErrorOrNil() error {
-	if len(eb.errs) > 0 {
-		return eb
+	if eb == nil || len(eb.errs) == 0 {
+		return nil
 	}
-	return nil
+
+	return eb
 }
 
 // AsError returns eb as an error
@@ -66,6 +122,21 @@ func (eb *ErrorBag) HasErrors() bool {
 // Size returns the number of errors currenting in the ErrorBag eb.
 func (eb *ErrorBag) Size() int {
 	return len(eb.errs)
+}
+
+func (eb *ErrorBag) Defer(ef ErrorFunc) {
+	eb.defers = append(eb.defers, ef)
+}
+
+func (eb *ErrorBag) Return(errors ...interface{}) error {
+	eb.stash(errors...)
+
+	for _, df := range eb.defers {
+		if err := df(); err != nil {
+			eb.errs = append(eb.errs, err)
+		}
+	}
+	return eb.ErrorOrNil()
 }
 
 // Visitor is the function reference passed to the Visit function or method.
@@ -113,29 +184,53 @@ func AsErrorBag(err error) *ErrorBag {
 // not be added. However, if err is a separate and distinct instance of
 // ErrorBag, then each of its errors will be added in turn to eb. In all cases,
 // eb is returned, modified or not.
-func (eb *ErrorBag) Add(err error) error {
+func (eb *ErrorBag) Add(err error, errors ...interface{}) error {
 	if err == nil {
-		return eb
+		return eb.ErrorOrNil()
+	}
+
+	if eb == nil {
+		eb = new(ErrorBag)
+	}
+
+	eb.add(err)
+
+	eb.stash(errors...)
+	return eb.ErrorOrNil()
+}
+
+func (eb *ErrorBag) add(err error) error {
+	if err == nil {
+		return eb.ErrorOrNil()
 	}
 
 	if oeb := AsErrorBag(err); oeb != nil {
-		if oeb == eb {
-			return eb
-		}
-
-		// if err is an ErrorBag (but it's not *this* ErrorBag),
-		// merge all the errors from oeb into eb.
-		return eb.Update(oeb.Errors())
+		return eb.Merge(oeb)
 	}
 
 	eb.errs = append(eb.errs, err)
 	return eb
 }
 
+func (eb *ErrorBag) Merge(oeb *ErrorBag) error {
+	if oeb == nil {
+		return eb
+	}
+
+	if eb != oeb {
+		for _, err := range oeb.errs {
+			eb.add(err)
+		}
+	}
+
+	return eb
+}
+
 // Update calls Add for each error in errs then returns eb.
+// Deprecated: Add now takes multiple arguments
 func (eb *ErrorBag) Update(errs []error) error {
 	for _, err := range errs {
-		eb.Add(err)
+		eb.add(err)
 	}
 	return eb
 }

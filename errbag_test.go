@@ -171,3 +171,144 @@ func (eb *ErrorBag) GoString() string {
 
 	return fmt.Sprintf("&errbag.ErrorBag{errs: []error{%s}}", strings.Join(es, ", "))
 }
+
+//----------------------------------------------------------------------------
+
+type newTestcase struct {
+	err    error
+	others []interface{}
+}
+
+func (tc *newTestcase) want() *ErrorBag {
+	if tc.err == nil {
+		return nil
+	}
+
+	var eb *ErrorBag
+
+	if e, ok := tc.err.(errBagger); ok {
+		eb = e.errBag()
+	} else {
+		eb = new(ErrorBag)
+		eb.Add(tc.err)
+	}
+
+	if len(tc.others) == 0 {
+		return eb
+	}
+
+	for _, o := range tc.others {
+		if err, ok := o.(error); ok && err != nil {
+			eb.Add(err)
+		} else if ef, ok := o.(func() error); ok {
+			if err := ef(); err != nil {
+				eb.Add(err)
+			}
+		} else if ef, ok := o.(ErrorFunc); ok {
+			if err := ef(); err != nil {
+				eb.Add(err)
+			}
+		}
+	}
+
+	return eb
+}
+
+func (tc *newTestcase) test(t *testing.T) {
+	want := tc.want()
+	if got := New(tc.err, tc.others...); !reflect.DeepEqual(got, want) {
+		t.Errorf("New(%q, []interface{}{%#v}...) := (%#v); Wanted(%#v)", tc.err, tc.others, got, want)
+	}
+}
+
+func mkNewTestcase(err error, others ...interface{}) *newTestcase {
+	return &newTestcase{err, others}
+}
+
+func newTestcaseLabel(err interface{}, others ...interface{}) string {
+	parts := make([]string, len(others)+2)
+	if err == nil {
+		parts[0] = "nilErr"
+	} else if _, ok := err.(error); ok {
+		parts[0] = "anErr"
+	} else {
+		panic(fmt.Sprintf("bad value: %v", err))
+	}
+
+	funclabel := func(f func() error) string {
+		if f == nil {
+			return "noFunc"
+		}
+		if err := f(); err != nil {
+			return "errFunc"
+		}
+		return "nilFunc"
+	}
+
+	if others == nil {
+		parts[1] = "none"
+	} else if len(others) == 0 {
+		parts[1] = "empty"
+	} else {
+		for i, o := range others {
+			var part string
+			if o == nil {
+				part = "nilErr"
+			} else {
+				switch v := o.(type) {
+				case error:
+					part = "anErr"
+
+				case ErrorFunc:
+					part = funclabel(v)
+				}
+			}
+
+			parts[i+1] = part
+		}
+	}
+
+	return strings.Join(parts, "-")
+}
+
+func TestNew(t *testing.T) {
+	var (
+		nilErr  error
+		anErr   = errors.New("an error")
+		nilFunc = func() error { return nil }
+		errFunc = func() error { return anErr }
+	)
+
+	// TODO: This does not test the case that no ErrorFunc should be called if
+	//       the primary err is nil.
+	ovals := []interface{}{nil, nilErr, anErr, nilFunc, errFunc}
+	cases := make(map[string]*newTestcase)
+
+	var fill func([]interface{}, int, func([]interface{}))
+
+	fill = func(list []interface{}, pos int, emit func([]interface{})) {
+		for _, ov := range ovals {
+			list[pos] = ov
+			if pos == len(list)-1 {
+				emit(list)
+			} else {
+				fill(list, pos+1, emit)
+			}
+		}
+	}
+
+	for _, err := range []error{nilErr, anErr} {
+		cases[newTestcaseLabel(err)] = mkNewTestcase(err)
+
+		// builds all permutations of "ovals" at length 1, 2 and 3
+		for n := 1; n <= 3; n++ {
+			fill(make([]interface{}, n), 0, func(a []interface{}) {
+				cases[newTestcaseLabel(err, a...)] = mkNewTestcase(err, a...)
+			})
+		}
+	}
+
+	for name, tc := range cases {
+		t.Run(name, tc.test)
+	}
+}
